@@ -6,6 +6,7 @@ import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLNonTransientException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -509,7 +510,18 @@ public class Process {
                                                 entitySpawnIdentities.putIfAbsent(update.getUuid(), previousIdentity);
                                             }
                                         }
-                                        EntitySpawnIdentity createdIdentity = entitySpawnUpdates.apply(update);
+                                        EntitySpawnIdentity createdIdentity;
+                                        try {
+                                            createdIdentity = applyEntitySpawnUpdate(connection, writeBatch, entitySpawnUpdates, update);
+                                        }
+                                        catch (UnresolvedEntityRemovalException e) {
+                                            // The event owns this isolated transaction. Only retire it
+                                            // after the acknowledged rollback below succeeds.
+                                            Database.acknowledgeRollbackOnlyTransaction();
+                                            entitySpawnUpdates.afterRetain();
+                                            duplicateEntityUuidFailure = e;
+                                            break;
+                                        }
                                         if (createdIdentity != null) {
                                             entitySpawnIdentities.put(createdIdentity.getUuid(), createdIdentity);
                                             promotedEntityIdentities.add(createdIdentity.getUuid());
@@ -574,9 +586,16 @@ public class Process {
                             return;
                         }
                         if (duplicateEntityUuidFailure != null) {
-                            EntityInteraction interaction = (EntityInteraction) consumerObject.get(id);
-                            cancelEntityInteractionPromotion(interaction);
-                            ErrorReporter.report(new IllegalStateException("Dropped entity interaction after a duplicate DuckDB entity UUID prevented identity creation: " + interaction.getEntityUuid(), duplicateEntityUuidFailure));
+                            if (action == ENTITY_SPAWN_UPDATE) {
+                                EntitySpawnData removal = (EntitySpawnData) consumerObject.get(id);
+                                EntitySpawnTracking.clearTracking(removal.getUuid());
+                                ErrorReporter.report(new IllegalStateException("Dropped entity removal after a duplicate DuckDB entity UUID remained unresolved in a fresh transaction; terminal removal was not recorded: " + removal.getUuid(), duplicateEntityUuidFailure));
+                            }
+                            else {
+                                EntityInteraction interaction = (EntityInteraction) consumerObject.get(id);
+                                cancelEntityInteractionPromotion(interaction);
+                                ErrorReporter.report(new IllegalStateException("Dropped entity interaction after a duplicate DuckDB entity UUID prevented identity creation: " + interaction.getEntityUuid(), duplicateEntityUuidFailure));
+                            }
                             retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
                             return;
                         }
@@ -1076,6 +1095,69 @@ public class Process {
             failure = failure.getCause();
         }
         return !sqlFailure;
+    }
+
+    private static EntitySpawnIdentity applyEntitySpawnUpdate(Connection connection, ConsumerWriteBatch batch,
+            ConsumerEntitySpawnUpdates updates, EntitySpawnData data) throws Exception {
+        if (!ConfigHandler.databaseType.isDuckDB() || data.getOperation() != EntitySpawnData.Operation.REMOVED) {
+            return updates.apply(data);
+        }
+
+        EntitySpawnIdentity[] identity = new EntitySpawnIdentity[1];
+        try {
+            batch.executeAtomically("entity_removal", () -> identity[0] = updates.apply(data));
+            return identity[0];
+        }
+        catch (Exception failure) {
+            if (!isDuplicateEntityRemovalFailure(data, failure)) {
+                throw failure;
+            }
+            // DuckDB constraint failures abort the transaction. A lookup here
+            // cannot reconcile a row committed after the old snapshot began.
+            Database.acknowledgeRollbackOnlyTransaction();
+            if (!batch.commit()) {
+                throw new SQLException("Unable to roll back conflicting entity removal", failure);
+            }
+            updates.afterRetain();
+            batch.begin();
+        }
+
+        try {
+            batch.executeAtomically("entity_removal_retry", () -> identity[0] = updates.apply(data));
+        }
+        catch (Exception failure) {
+            if (!isDuplicateEntityRemovalFailure(data, failure)) {
+                throw failure;
+            }
+            throw new UnresolvedEntityRemovalException(failure);
+        }
+        // Reuse the reconciled identity for later events in this consumer batch.
+        return identity[0] != null ? identity[0]
+                : EntitySpawnStatement.loadIdentities(connection, Collections.singleton(data.getUuid())).get(data.getUuid());
+    }
+
+    private static final class UnresolvedEntityRemovalException extends SQLException {
+        private static final long serialVersionUID = 1L;
+
+        private UnresolvedEntityRemovalException(Exception cause) {
+            super("Entity removal UUID remains unresolved after transaction refresh", cause);
+        }
+    }
+
+    private static boolean isDuplicateEntityRemovalFailure(EntitySpawnData data, Throwable failure) {
+        if (!ConfigHandler.databaseType.isDuckDB() || data.getOperation() != EntitySpawnData.Operation.REMOVED) {
+            return false;
+        }
+        Set<Throwable> visited = new HashSet<>();
+        while (failure != null && visited.add(failure)) {
+            String message = failure.getMessage();
+            if (failure instanceof SQLException && message != null
+                    && message.contains("Constraint Error: Duplicate key \"uuid: " + data.getUuid() + "\" violates unique constraint")) {
+                return true;
+            }
+            failure = failure.getCause();
+        }
+        return false;
     }
 
     static boolean shouldDiscardFailedEvent(DatabaseType databaseType, int action, Throwable failure) {
