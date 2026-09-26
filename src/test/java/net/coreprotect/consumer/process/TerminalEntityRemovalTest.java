@@ -16,22 +16,30 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.EntityType;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.MockedStatic;
 
 import net.coreprotect.config.ConfigHandler;
+import net.coreprotect.config.Config;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.DatabaseType;
 import net.coreprotect.model.entity.EntityInteractionOrigin;
+import net.coreprotect.model.entity.EntityInteraction;
+import net.coreprotect.model.entity.EntityInteractionAction;
 import net.coreprotect.model.entity.EntitySpawnData;
 import net.coreprotect.utility.ErrorReporter;
 
@@ -40,11 +48,18 @@ class TerminalEntityRemovalTest {
     private Connection observer;
     private Connection writer;
     private Location location;
+    private World world;
     private MockedStatic<Database> database;
     private MockedStatic<ErrorReporter> reporter;
     private final List<Throwable> failures = new ArrayList<>();
+    private final List<String> warnings = new ArrayList<>();
+    private int stackTraces;
+    private Handler warningHandler;
+    private boolean originalApiEnabled;
+    private boolean originalParentHandlers;
     private int failRollbackFrom = Integer.MAX_VALUE;
     private int rollbacks;
+    private SqlAction afterRollback;
     private final UUID problem = UUID.fromString("00000000-0000-0000-0000-000000000001");
     private final UUID before = UUID.fromString("00000000-0000-0000-0000-000000000002");
     private final UUID after = UUID.fromString("00000000-0000-0000-0000-000000000003");
@@ -56,7 +71,10 @@ class TerminalEntityRemovalTest {
         ConfigHandler.worlds.put("test", 1);
         ConfigHandler.playerIdCache.put("#test", 1);
         Consumer.initialize();
-        World world = mock(World.class);
+        originalApiEnabled = Config.getGlobal().API_ENABLED;
+        Config.getGlobal().API_ENABLED = false;
+        ConfigHandler.entities.put("cow", 1);
+        world = mock(World.class);
         when(world.getName()).thenReturn("test");
         location = new Location(world, 40, 65, 60, 90, 15);
         String url = "jdbc:duckdb:" + directory.resolve("test.duckdb");
@@ -65,15 +83,33 @@ class TerminalEntityRemovalTest {
         writer = DriverManager.getConnection(url);
         reporter = mockStatic(ErrorReporter.class);
         reporter.when(() -> ErrorReporter.report(any(Throwable.class))).thenAnswer(call -> {
+            stackTraces++;
             failures.add(call.getArgument(0));
             return false;
         });
+        reporter.when(() -> ErrorReporter.report(any(Throwable.class), eq(false))).thenAnswer(call -> {
+            failures.add(call.getArgument(0));
+            return false;
+        });
+        Logger logger = Logger.getLogger("CoreProtect");
+        originalParentHandlers = logger.getUseParentHandlers();
+        logger.setUseParentHandlers(false);
+        warningHandler = new Handler() {
+            @Override public void publish(LogRecord record) { warnings.add(record.getMessage()); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(warningHandler);
         database = mockStatic(Database.class, CALLS_REAL_METHODS);
         database.when(() -> Database.getConnection(false, 500)).thenReturn(writer);
     }
 
     @AfterEach
     void tearDown() throws Exception {
+        Logger.getLogger("CoreProtect").removeHandler(warningHandler);
+        Logger.getLogger("CoreProtect").setUseParentHandlers(originalParentHandlers);
+        Config.getGlobal().API_ENABLED = originalApiEnabled;
+        ConfigHandler.entities.remove("cow");
         database.close();
         reporter.close();
         writer.close();
@@ -132,6 +168,8 @@ class TerminalEntityRemovalTest {
             assertEquals(2, count("SELECT count(*) FROM co_entity_spawn WHERE removed=1"));
             assertEquals(0, count("SELECT count(*) FROM co_entity_spawn WHERE uuid='" + problem + "'"));
             assertEquals(1, failures.size(), failures.toString());
+            assertEquals(0, stackTraces);
+            assertEquals(1, warnings.size());
             assertTrue(failures.get(0).getMessage().contains(problem.toString()));
             assertTrue(failures.get(0).getMessage().contains("Dropped entity removal"));
         }
@@ -184,8 +222,8 @@ class TerminalEntityRemovalTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = { 1, 2 })
-    void failedRollbackNeverRetiresTheRemoval(int failedAttempt) throws Exception {
+    @CsvSource({ "1,false", "2,false", "1,true", "2,true" })
+    void failedRollbackNeverRetiresTheEvent(int failedAttempt, boolean interaction) throws Exception {
         insert(problem, 0);
         try (Connection reader = DriverManager.getConnection(observer.getMetaData().getURL())) {
             reader.setAutoCommit(false);
@@ -195,7 +233,8 @@ class TerminalEntityRemovalTest {
             execute("DELETE FROM co_entity_spawn WHERE uuid='" + problem + "'");
             failRollbackFrom = failedAttempt;
             interceptInsert(() -> { });
-            enqueue(removal(problem));
+            if (interaction) enqueueInteraction(problem);
+            else enqueue(removal(problem));
             enqueue(removal(after));
             Process.processConsumer(0, false);
             assertEquals(2, Consumer.consumer.get(0).size());
@@ -203,6 +242,86 @@ class TerminalEntityRemovalTest {
             assertFalse(Consumer.isPaused);
             assertFalse(failures.stream().anyMatch(failure -> failure.getMessage().contains("Dropped entity removal")));
         }
+    }
+
+    @Test
+    void interactionReconcilesConcurrentIdentityAndRecordsBothClicks() throws Exception {
+        interceptInsert(() -> insert(problem, 0));
+        enqueueInteraction(problem);
+        enqueueInteraction(problem);
+        Process.processConsumer(0, false);
+        assertDrained();
+        assertEquals(2, count("SELECT count(*) FROM co_entity_interaction"));
+        assertEquals(1, count("SELECT count(*) FROM co_entity_spawn WHERE block_rowid=77 AND kill_rowid=88 AND removed=0 AND x=40"));
+        assertEquals(2, count("SELECT count(*) FROM co_entity_interaction i JOIN co_entity_spawn e ON i.entity_spawn_rowid=e.rowid WHERE i.x=10 AND i.y=20 AND i.z=30"));
+        assertTrue(failures.isEmpty(), failures.toString());
+    }
+
+    @Test
+    void interactionRetriesInsertionWhenConflictDisappearsAfterRollback() throws Exception {
+        // A genuine concurrent insert aborts the writer; delete it just after
+        // successful rollback so the retry must create a new identity.
+        interceptInsert(() -> insert(problem, 0));
+        afterRollback = () -> execute("DELETE FROM co_entity_spawn WHERE uuid='" + problem + "'");
+        enqueueInteraction(problem);
+        Process.processConsumer(0, false);
+        assertDrained();
+        assertEquals(1, count("SELECT count(*) FROM co_entity_interaction"));
+        assertEquals(1, count("SELECT count(*) FROM co_entity_spawn WHERE block_rowid IS NULL AND removed=0"));
+        assertTrue(failures.isEmpty(), failures.toString());
+    }
+
+    @Test
+    void repeatedUnresolvableInteractionsEmitOneShortWarningAndDoNotTrapQueue() throws Exception {
+        insert(problem, 0);
+        try (Connection reader = DriverManager.getConnection(observer.getMetaData().getURL())) {
+            reader.setAutoCommit(false);
+            try (Statement statement = reader.createStatement(); ResultSet row = statement.executeQuery("SELECT * FROM co_entity_spawn")) {
+                assertTrue(row.next());
+            }
+            execute("DELETE FROM co_entity_spawn WHERE uuid='" + problem + "'");
+            for (int i = 0; i < 8; i++) enqueueInteraction(problem);
+            enqueue(removal(after));
+            database.when(() -> Database.getConnection(false, 500)).thenAnswer(call -> DriverManager.getConnection(observer.getMetaData().getURL()));
+            for (int i = 0; i < 9; i++) Process.processConsumer(0, false);
+            assertDrained();
+            assertEquals(0, count("SELECT count(*) FROM co_entity_interaction"));
+            assertEquals(1, count("SELECT count(*) FROM co_entity_spawn WHERE removed=1"));
+            assertEquals(8, failures.size(), "Detailed reports remain available without console stack traces");
+            assertEquals(0, stackTraces);
+            assertEquals(1, warnings.size());
+            assertTrue(warnings.get(0).contains("1 entity interaction"));
+            assertTrue(warnings.get(0).contains("not saved"));
+            assertFalse(warnings.get(0).contains("Exception"));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "Disk I/O error",
+            "Constraint Error: Duplicate key \"kill_rowid: 88\" violates unique constraint.",
+            "Constraint Error: Duplicate key \"uuid: 00000000-0000-0000-0000-000000000099\" violates unique constraint."
+    })
+    void unexpectedInteractionFailuresRemainVisibleAndRetained(String message) throws Exception {
+        interceptInsert(() -> { throw new SQLException(message); });
+        enqueueInteraction(problem);
+        enqueue(removal(after));
+        Process.processConsumer(0, false);
+        assertEquals(2, Consumer.consumer.get(0).size());
+        assertEquals(0, count("SELECT count(*) FROM co_entity_interaction"));
+        assertEquals(1, stackTraces);
+        assertTrue(warnings.isEmpty());
+        assertFalse(Consumer.isPaused);
+    }
+
+    private void enqueueInteraction(UUID uuid) {
+        int id = Consumer.consumer.get(0).size();
+        EntityInteraction data = new EntityInteraction(uuid, EntityType.COW,
+                new EntityInteractionOrigin(1, 10, 20, 30), location,
+                EntityInteractionAction.GENERIC, null, 1234);
+        Consumer.consumer.get(0).add(new Object[] { id, Process.ENTITY_INTERACTION, null, 0, null, 0, 0 });
+        Consumer.consumerUsers.get(0).put(id, new String[] { "#test", null });
+        Consumer.consumerObjects.get(0).put(id, data);
     }
 
     private EntitySpawnData removal(UUID uuid) {
@@ -262,6 +381,11 @@ class TerminalEntityRemovalTest {
                     throw new SQLException("Injected rollback failure");
                 }
                 Object result = method.invoke(writer, args);
+                if (method.getName().equals("rollback") && afterRollback != null) {
+                    SqlAction callback = afterRollback;
+                    afterRollback = null;
+                    callback.run();
+                }
                 if (method.getName().equals("createStatement")) {
                     return Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] { Statement.class }, (ignored, operation, parameters) -> {
                         if (operation.getName().equals("getConnection")) {

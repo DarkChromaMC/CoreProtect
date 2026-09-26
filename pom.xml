@@ -2,7 +2,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>net.coreprotect</groupId>
   <artifactId>CoreProtect</artifactId>
-  <version>25.0-rc2d-official-master-3af1079-terminal-uuid1</version>
+  <version>25.0-rc2d-official-master-3af1079-terminal-uuid2</version>
   <properties>
     <project.branch></project.branch>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

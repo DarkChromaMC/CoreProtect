@@ -80,6 +80,7 @@ public class Process {
 
     public static int lastLockUpdate = 0;
     private static volatile int currentConsumerSize = 0;
+    private static EntityUuidConflictReporter entityUuidConflicts = new EntityUuidConflictReporter();
     private static final int MAX_PREPARATION_FAILURES = 3;
     private static final int CLICKHOUSE_ACCESS_DENIED = 497;
     private static final Map<Object[], Integer> preparationFailures = new IdentityHashMap<>();
@@ -97,6 +98,7 @@ public class Process {
 
     protected static void resetPreparationFailures() {
         preparationFailures.clear();
+        entityUuidConflicts = new EntityUuidConflictReporter();
     }
 
     protected static int consumerDelay(boolean backlog) {
@@ -133,6 +135,7 @@ public class Process {
     }
 
     protected static void processConsumer(int processId, boolean lastRun) {
+        entityUuidConflicts.flush();
         List<PendingEntitySpawnLog> pendingEntitySpawnLogs = new ArrayList<>();
         Map<UUID, EntitySpawnIdentity> entitySpawnIdentities = new LinkedHashMap<>();
         Map<UUID, Location> pendingEntityIdentityConfirmations = new LinkedHashMap<>();
@@ -356,19 +359,14 @@ public class Process {
                                     EntitySpawnIdentity[] loggedIdentity = { existingIdentity };
                                     boolean[] identityActive = new boolean[1];
                                     try {
-                                        writeBatch.executeAtomically("entity_interaction_log", () -> {
-                                            if (loggedIdentity[0] == null) {
-                                                loggedIdentity[0] = EntitySpawnStatement.insertIdentity(batch, interaction.getTime(), interaction.getEntityUuid(), interaction.getOrigin(), interaction.getCurrentLocation());
-                                            }
-                                            identityActive[0] = EntityInteractionLogger.log(batch, loggedIdentity[0], interaction, logContext);
-                                        });
+                                        logEntityInteraction(connection, writeBatch, interaction, logContext, loggedIdentity, identityActive);
+                                    }
+                                    catch (UnresolvedEntityInteractionException e) {
+                                        Database.acknowledgeRollbackOnlyTransaction();
+                                        duplicateEntityUuidFailure = e;
+                                        break;
                                     }
                                     catch (Exception e) {
-                                        if (shouldDiscardFailedEvent(ConfigHandler.databaseType, action, e)) {
-                                            Database.acknowledgeRollbackOnlyTransaction();
-                                            duplicateEntityUuidFailure = e;
-                                            break;
-                                        }
                                         pendingEntityInteractions.add(new PendingEntityInteraction(user, interaction, false, true));
                                         throw e;
                                     }
@@ -589,12 +587,14 @@ public class Process {
                             if (action == ENTITY_SPAWN_UPDATE) {
                                 EntitySpawnData removal = (EntitySpawnData) consumerObject.get(id);
                                 EntitySpawnTracking.clearTracking(removal.getUuid());
-                                ErrorReporter.report(new IllegalStateException("Dropped entity removal after a duplicate DuckDB entity UUID remained unresolved in a fresh transaction; terminal removal was not recorded: " + removal.getUuid(), duplicateEntityUuidFailure));
+                                entityUuidConflicts.record(true, removal.getUuid());
+                                ErrorReporter.report(new IllegalStateException("Dropped entity removal after a duplicate DuckDB entity UUID remained unresolved in a fresh transaction; terminal removal was not recorded: " + removal.getUuid(), duplicateEntityUuidFailure), false);
                             }
                             else {
                                 EntityInteraction interaction = (EntityInteraction) consumerObject.get(id);
                                 cancelEntityInteractionPromotion(interaction);
-                                ErrorReporter.report(new IllegalStateException("Dropped entity interaction after a duplicate DuckDB entity UUID prevented identity creation: " + interaction.getEntityUuid(), duplicateEntityUuidFailure));
+                                entityUuidConflicts.record(false, interaction.getEntityUuid());
+                                ErrorReporter.report(new IllegalStateException("Dropped entity interaction after a duplicate DuckDB entity UUID prevented identity creation: " + interaction.getEntityUuid(), duplicateEntityUuidFailure), false);
                             }
                             retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
                             return;
@@ -1097,6 +1097,52 @@ public class Process {
         return !sqlFailure;
     }
 
+    private static void logEntityInteraction(Connection connection, ConsumerWriteBatch batch,
+            EntityInteraction interaction, EntityInteractionLogger.LogContext context,
+            EntitySpawnIdentity[] identity, boolean[] active) throws Exception {
+        Database.SavepointOperation operation = () -> {
+            if (identity[0] == null) {
+                identity[0] = EntitySpawnStatement.insertIdentity(batch, interaction.getTime(), interaction.getEntityUuid(), interaction.getOrigin(), interaction.getCurrentLocation());
+            }
+            active[0] = EntityInteractionLogger.log(batch, identity[0], interaction, context);
+        };
+        try {
+            batch.executeAtomically("entity_interaction_log", operation);
+            return;
+        }
+        catch (Exception failure) {
+            if (identity[0] != null || !isDuplicateEntityUuidFailure(interaction.getEntityUuid(), failure)) {
+                throw failure;
+            }
+            // This interaction owns an isolated DuckDB transaction. Refresh the
+            // snapshot only after confirming rollback of the failed insert.
+            Database.acknowledgeRollbackOnlyTransaction();
+            if (!batch.commit()) {
+                throw new SQLException("Unable to roll back conflicting entity interaction", failure);
+            }
+            batch.begin();
+        }
+
+        identity[0] = EntitySpawnStatement.loadIdentities(connection, Collections.singleton(interaction.getEntityUuid())).get(interaction.getEntityUuid());
+        try {
+            batch.executeAtomically("entity_interaction_retry", operation);
+        }
+        catch (Exception failure) {
+            if (identity[0] != null || !isDuplicateEntityUuidFailure(interaction.getEntityUuid(), failure)) {
+                throw failure;
+            }
+            throw new UnresolvedEntityInteractionException(failure);
+        }
+    }
+
+    private static final class UnresolvedEntityInteractionException extends SQLException {
+        private static final long serialVersionUID = 1L;
+
+        private UnresolvedEntityInteractionException(Exception cause) {
+            super("Entity interaction UUID remains unresolved after transaction refresh", cause);
+        }
+    }
+
     private static EntitySpawnIdentity applyEntitySpawnUpdate(Connection connection, ConsumerWriteBatch batch,
             ConsumerEntitySpawnUpdates updates, EntitySpawnData data) throws Exception {
         if (!ConfigHandler.databaseType.isDuckDB() || data.getOperation() != EntitySpawnData.Operation.REMOVED) {
@@ -1145,32 +1191,18 @@ public class Process {
     }
 
     private static boolean isDuplicateEntityRemovalFailure(EntitySpawnData data, Throwable failure) {
-        if (!ConfigHandler.databaseType.isDuckDB() || data.getOperation() != EntitySpawnData.Operation.REMOVED) {
-            return false;
-        }
-        Set<Throwable> visited = new HashSet<>();
-        while (failure != null && visited.add(failure)) {
-            String message = failure.getMessage();
-            if (failure instanceof SQLException && message != null
-                    && message.contains("Constraint Error: Duplicate key \"uuid: " + data.getUuid() + "\" violates unique constraint")) {
-                return true;
-            }
-            failure = failure.getCause();
-        }
-        return false;
+        return data.getOperation() == EntitySpawnData.Operation.REMOVED && isDuplicateEntityUuidFailure(data.getUuid(), failure);
     }
 
-    static boolean shouldDiscardFailedEvent(DatabaseType databaseType, int action, Throwable failure) {
-        if (!databaseType.isDuckDB() || action != ENTITY_INTERACTION) {
+    private static boolean isDuplicateEntityUuidFailure(UUID uuid, Throwable failure) {
+        if (!ConfigHandler.databaseType.isDuckDB()) {
             return false;
         }
-
         Set<Throwable> visited = new HashSet<>();
         while (failure != null && visited.add(failure)) {
             String message = failure.getMessage();
             if (failure instanceof SQLException && message != null
-                    && message.contains("Constraint Error: Duplicate key \"uuid: ")
-                    && message.contains("violates unique constraint")) {
+                    && message.contains("Constraint Error: Duplicate key \"uuid: " + uuid + "\" violates unique constraint")) {
                 return true;
             }
             failure = failure.getCause();
