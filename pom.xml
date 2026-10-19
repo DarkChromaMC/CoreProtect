@@ -110,6 +110,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.5</version>
         <configuration>
+          <argLine>-javaagent:${settings.localRepository}/org/mockito/mockito-core/5.23.0/mockito-core-5.23.0.jar --enable-native-access=ALL-UNNAMED</argLine>
           <systemPropertyVariables>
             <plugin.version>${project.version}</plugin.version>
           </systemPropertyVariables>
