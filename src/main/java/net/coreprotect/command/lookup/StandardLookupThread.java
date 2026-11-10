@@ -56,6 +56,7 @@ import net.coreprotect.utility.ItemUtils;
 import net.coreprotect.utility.MaterialUtils;
 import net.coreprotect.utility.StringUtils;
 import net.coreprotect.utility.WorldUtils;
+import net.coreprotect.database.DuckDBLookupQuery;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.LookupThrottle;
 
@@ -235,6 +236,15 @@ public class StandardLookupThread implements Runnable {
                         Set<UUID> databaseCandidates = includeEntityContainers || includeEntityInteractions ? EntitySpawnStatement.loadActiveUuids(connection, finalLocation, radius) : EntitySpawnStatement.loadActiveUuids(connection, finalLocation, radius, timeStart, timeEnd);
                         EntitySpawnTracking.LoadedEntityRadius loadedEntities = EntitySpawnTracking.findLoadedEntities(finalLocation, radius, databaseCandidates);
                         entityContext = EntityLookupContext.legacy(loadedEntities.getInside(), loadedEntities.getLoadedCandidates());
+                    }
+
+                    // a DuckDB lookup the spatial index can't keep small would read whole tables, which on a large
+                    // database fills DuckDB's memory at once: refused instead (rollbacks don't come through here)
+                    if (ConfigHandler.databaseType.isDuckDB() && radius != null && finalLocation != null && finalLocation.getWorld() != null
+                            && !DuckDBLookupQuery.lookupWithinBudget(connection, WorldUtils.getWorldId(finalLocation.getWorld().getName()), radius, timeStart)) {
+                        Chat.sendMessage(player, DuckDBLookupQuery.refuseLookup(player));
+                        statement.close();
+                        return;
                     }
 
                     Long[] rowData = new Long[] { 0L, 0L, 0L, 0L, 0L };

@@ -61,9 +61,13 @@ public final class EntityInteractionLookup {
             boolean combinedDuckDBPage = ConfigHandler.databaseType.isDuckDB();
             String query;
             if (combinedDuckDBPage) {
-                String sourceTable = DuckDBLookupQuery.entityTable(statement.getConnection(), "entity_interaction", Collections.singleton(entitySpawnRowId), "spatial_rows");
+                String[] tables = DuckDBLookupQuery.inspectEntityTables(statement.getConnection(), "entity_interaction", Collections.singleton(entitySpawnRowId));
+                if (tables == null) {
+                    result.add(DuckDBLookupQuery.refuseInspect(commandSender));
+                    return result;
+                }
                 String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.wid,data_rows.x,data_rows.y,data_rows.z,data_rows.type,data_rows.action,data_rows.rolled_back";
-                query = DuckDBLookupQuery.pageQuery(sourceTable, ConfigHandler.prefix + "entity_interaction", where, columns, true, limit, pageStart);
+                query = DuckDBLookupQuery.pageQuery(tables, where, columns, true, limit, pageStart);
             }
             else {
                 try (ResultSet results = statement.executeQuery("SELECT COUNT(*) AS count FROM " + ConfigHandler.prefix + "entity_interaction WHERE " + where)) {

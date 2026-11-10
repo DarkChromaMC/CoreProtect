@@ -116,19 +116,23 @@ public class ChestTransactionLookup {
             String query;
             ResultSet results;
             if (combinedDuckDBPage) {
-                String sourceTable;
+                String[] tables;
                 if (entitySpawnRowId != null) {
-                    sourceTable = DuckDBLookupQuery.entityTable(statement.getConnection(), tableName, Collections.singleton(entitySpawnRowId), "spatial_rows");
+                    tables = DuckDBLookupQuery.inspectEntityTables(statement.getConnection(), tableName, Collections.singleton(entitySpawnRowId));
                 }
                 else {
                     int minimumX = exact ? l.getBlockX() : Math.min(x, x2);
                     int maximumX = exact ? l.getBlockX() : Math.max(x, x2);
                     int minimumZ = exact ? l.getBlockZ() : Math.min(z, z2);
                     int maximumZ = exact ? l.getBlockZ() : Math.max(z, z2);
-                    sourceTable = DuckDBLookupQuery.spatialTable(statement.getConnection(), tableName, worldId, minimumX, maximumX, minimumZ, maximumZ, "spatial_rows");
+                    tables = DuckDBLookupQuery.inspectTables(statement.getConnection(), tableName, worldId, minimumX, maximumX, minimumZ, maximumZ);
+                }
+                if (tables == null) {
+                    result.add(DuckDBLookupQuery.refuseInspect(commandSender));
+                    return result;
                 }
                 String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.wid,data_rows.x,data_rows.y,data_rows.z,data_rows.action,data_rows.type,data_rows.data,data_rows.amount,data_rows.metadata,data_rows.rolled_back";
-                query = DuckDBLookupQuery.pageQuery(sourceTable, table, where, columns, entitySpawnRowId != null, limit, pageStart);
+                query = DuckDBLookupQuery.pageQuery(tables, where, columns, entitySpawnRowId != null, limit, pageStart);
                 results = statement.executeQuery(query);
             }
             else {

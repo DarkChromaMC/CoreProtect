@@ -18,6 +18,7 @@ import org.bukkit.World;
 
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.DuckDBLookupQuery;
+import net.coreprotect.database.LookupTooBroadException;
 import net.coreprotect.database.DuckDBSpatialIndex;
 import net.coreprotect.database.LocationQuery;
 import net.coreprotect.model.action.LookupActions;
@@ -291,6 +292,9 @@ final class LookupFilter {
         int minimumZ = radius > 0 ? MessageAPI.clampToInt((long) z - radius) : z;
         int maximumZ = radius > 0 ? MessageAPI.clampToInt((long) z + radius) : z;
         int worldId = WorldUtils.getWorldId(location.getWorld().getName());
+        if (!DuckDBLookupQuery.lookupWithinBudget(connection, worldId, minimumX, maximumX, minimumZ, maximumZ, checkTime)) {
+            throw new LookupTooBroadException();
+        }
         return DuckDBLookupQuery.spatialTable(connection, table, worldId, minimumX, maximumX, minimumZ, maximumZ, alias);
     }
 

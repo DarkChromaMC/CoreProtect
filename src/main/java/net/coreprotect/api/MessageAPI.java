@@ -11,6 +11,7 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.LookupRaw;
+import net.coreprotect.database.LookupTooBroadException;
 import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.WorldUtils;
@@ -81,6 +82,9 @@ public class MessageAPI {
                     }
                 }
             }
+        }
+        catch (LookupTooBroadException e) {
+            throw e;   // the caller is told it was refused, not handed an empty result
         }
         catch (Exception e) {
             ErrorReporter.report(e);

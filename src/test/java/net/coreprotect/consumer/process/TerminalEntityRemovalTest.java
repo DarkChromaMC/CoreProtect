@@ -39,6 +39,8 @@ class TerminalEntityRemovalTest {
     @TempDir Path directory;
     private Connection observer;
     private Connection writer;
+    // Location keeps its world only weakly: hold the mock here or a GC between tests unloads it
+    private World world;
     private Location location;
     private MockedStatic<Database> database;
     private MockedStatic<ErrorReporter> reporter;
@@ -56,7 +58,7 @@ class TerminalEntityRemovalTest {
         ConfigHandler.worlds.put("test", 1);
         ConfigHandler.playerIdCache.put("#test", 1);
         Consumer.initialize();
-        World world = mock(World.class);
+        world = mock(World.class);
         when(world.getName()).thenReturn("test");
         location = new Location(world, 40, 65, 60, 90, 15);
         String url = "jdbc:duckdb:" + directory.resolve("test.duckdb");

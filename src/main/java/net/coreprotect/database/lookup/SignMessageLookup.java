@@ -65,9 +65,13 @@ public class SignMessageLookup {
             String query;
             ResultSet results;
             if (combinedDuckDBPage) {
-                String sourceTable = DuckDBLookupQuery.spatialTable(statement.getConnection(), "sign", worldId, x, x, z, z, "spatial_rows");
+                String[] tables = DuckDBLookupQuery.inspectTables(statement.getConnection(), "sign", worldId, x, x, z, z);
+                if (tables == null) {
+                    result.add(DuckDBLookupQuery.refuseInspect(commandSender));
+                    return result;
+                }
                 String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.face,data_rows.line_1,data_rows.line_2,data_rows.line_3,data_rows.line_4,data_rows.line_5,data_rows.line_6,data_rows.line_7,data_rows.line_8";
-                query = DuckDBLookupQuery.pageQuery(sourceTable, ConfigHandler.prefix + "sign", where, columns, false, limit, pageStart);
+                query = DuckDBLookupQuery.pageQuery(tables, where, columns, false, limit, pageStart);
                 results = statement.executeQuery(query);
             }
             else {

@@ -85,6 +85,10 @@ public class BlockLookup {
                 index = WorldUtils.getWidIndex("block");
             }
             else {
+                // entityBlockRowIds scans the whole block table: on DuckDB only when that table is small enough
+                if (ConfigHandler.databaseType.isDuckDB() && !DuckDBLookupQuery.inspectWholeTable(statement.getConnection(), "block")) {
+                    return DuckDBLookupQuery.refuseInspect(commandSender);
+                }
                 where = "rowid IN(" + entityBlockRowIds(statement, entitySpawnRowId) + ") AND action IN(" + LookupActions.ENTITY_SPAWN + "," + LookupActions.ENTITY_KILL + ") AND time >= " + checkTime;
                 index = "";
             }
@@ -92,12 +96,18 @@ public class BlockLookup {
             String query;
             ResultSet results;
             if (combinedDuckDBPage) {
-                String sourceTable = entitySpawnRowId == null ? DuckDBLookupQuery.spatialTable(statement.getConnection(), "block", worldId, x, x, z, z, "spatial_rows") : ConfigHandler.prefix + "block";
                 String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.action,data_rows.type,data_rows.data,data_rows.rolled_back";
                 if (entitySpawnRowId != null) {
                     columns += ",data_rows.wid,data_rows.x,data_rows.y,data_rows.z";
+                    query = DuckDBLookupQuery.pageQuery(ConfigHandler.prefix + "block", ConfigHandler.prefix + "block", where, columns, false, limit, page_start);
                 }
-                query = DuckDBLookupQuery.pageQuery(sourceTable, ConfigHandler.prefix + "block", where, columns, false, limit, page_start);
+                else {
+                    String[] tables = DuckDBLookupQuery.inspectTables(statement.getConnection(), "block", worldId, x, x, z, z);
+                    if (tables == null) {
+                        return DuckDBLookupQuery.refuseInspect(commandSender);
+                    }
+                    query = DuckDBLookupQuery.pageQuery(tables, where, columns, false, limit, page_start);
+                }
                 results = statement.executeQuery(query);
             }
             else {

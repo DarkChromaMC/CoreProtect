@@ -64,9 +64,12 @@ public class InteractionLookup {
             String query;
             ResultSet results;
             if (combinedDuckDBPage) {
-                String sourceTable = DuckDBLookupQuery.spatialTable(statement.getConnection(), "block", worldId, x, x, z, z, "spatial_rows");
+                String[] tables = DuckDBLookupQuery.inspectTables(statement.getConnection(), "block", worldId, x, x, z, z);
+                if (tables == null) {
+                    return DuckDBLookupQuery.refuseInspect(commandSender);
+                }
                 String columns = "data_rows.time,data_rows." + ConfigHandler.databaseType.getUserColumn() + ",data_rows.action,data_rows.type,data_rows.data,data_rows.rolled_back";
-                query = DuckDBLookupQuery.pageQuery(sourceTable, ConfigHandler.prefix + "block", where, columns, false, limit, pageStart);
+                query = DuckDBLookupQuery.pageQuery(tables, where, columns, false, limit, pageStart);
                 results = statement.executeQuery(query);
             }
             else {

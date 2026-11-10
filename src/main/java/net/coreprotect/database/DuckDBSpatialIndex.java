@@ -18,6 +18,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.duckdb.DuckDBConnection;
 
 import net.coreprotect.utility.DatabaseUtils;
+import net.coreprotect.utility.ErrorReporter;
 
 public final class DuckDBSpatialIndex {
 
@@ -115,6 +116,63 @@ public final class DuckDBSpatialIndex {
     public static String entityTableExpression(Connection connection, String prefix, String table, Collection<Integer> entitySpawnRowIds, String alias) {
         List<RowRange> ranges = entityRanges(connection, prefix, table, entitySpawnRowIds);
         return tableExpression(prefix, table, ranges, alias);
+    }
+
+    /**
+     * Source and data table expressions for an interactive lookup, or null when the index can't keep the lookup under
+     * maximumRows. Without the index a DuckDB lookup scans the whole table, which on a large database fills DuckDB's
+     * memory limit at once; a caller should refuse instead.
+     */
+    public static String[] boundedTableExpressions(Connection connection, String prefix, String table, int worldId, int minimumX, int maximumX, int minimumZ, int maximumZ, long maximumRows, String sourceAlias, String dataAlias) {
+        List<RowRange> ranges = spatialRanges(connection, prefix, table, worldId, minimumX, maximumX, minimumZ, maximumZ, null, null);
+        return boundedTableExpressions(connection, prefix, table, ranges, maximumRows, sourceAlias, dataAlias);
+    }
+
+    public static String[] boundedEntityTableExpressions(Connection connection, String prefix, String table, Collection<Integer> entitySpawnRowIds, long maximumRows, String sourceAlias, String dataAlias) {
+        List<RowRange> ranges = entityRanges(connection, prefix, table, entitySpawnRowIds);
+        return boundedTableExpressions(connection, prefix, table, ranges, maximumRows, sourceAlias, dataAlias);
+    }
+
+    static String[] boundedTableExpressions(Connection connection, String prefix, String table, List<RowRange> ranges, long maximumRows, String sourceAlias, String dataAlias) {
+        if (ranges == null) {
+            // no usable narrowing: only a table small enough to scan whole is allowed
+            if (!rowsAtMost(connection, prefix + table, 1L, maximumRows)) {
+                return null;
+            }
+        }
+        else {
+            long rows = 0L;
+            RowRange tail = null;
+            for (RowRange range : ranges) {
+                rows += range.rows;
+                if (range.end == Long.MAX_VALUE) {
+                    tail = range;
+                }
+            }
+            if (rows > maximumRows) {
+                return null;
+            }
+            // rows written since the last index segment
+            if (tail != null && !rowsAtMost(connection, prefix + table, tail.start, maximumRows - rows)) {
+                return null;
+            }
+        }
+        return new String[] { tableExpression(prefix, table, ranges, sourceAlias), tableExpression(prefix, table, ranges, dataAlias) };
+    }
+
+    private static boolean rowsAtMost(Connection connection, String tableName, long startRowId, long maximumRows) {
+        if (maximumRows < 0L) {
+            return false;
+        }
+        // the LIMIT stops the scan as soon as the answer is known
+        String sql = "SELECT COUNT(*) FROM (SELECT 1 FROM " + tableName + " WHERE rowid >= " + startRowId + " LIMIT " + (maximumRows + 1L) + ")";
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+            return resultSet.next() && resultSet.getLong(1) <= maximumRows;
+        }
+        catch (SQLException exception) {
+            ErrorReporter.report(exception);
+            return false;
+        }
     }
 
     private static String tableExpression(String prefix, String table, List<RowRange> ranges, String alias) {
@@ -241,7 +299,7 @@ public final class DuckDBSpatialIndex {
         long previousEnd = 0L;
         for (Segment segment : snapshot.segments) {
             if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L) {
-                addRange(ranges, previousEnd + 1L, segment.startRowId - 1L);
+                addRange(ranges, previousEnd + 1L, segment.startRowId - 1L, segment.startRowId - 1L - previousEnd);
             }
             previousEnd = Math.max(previousEnd, segment.endRowId);
             boolean spatialMatch = chunks.length > 0 && segment.chunks.mightContainAny(chunks);
@@ -249,7 +307,7 @@ public final class DuckDBSpatialIndex {
             boolean requiredRowMatch = containsAny(segment, requiredRowIds);
             if (spatialMatch || entityMatch || requiredRowMatch) {
                 matchedSegments++;
-                addRange(ranges, segment.startRowId, segment.endRowId);
+                addRange(ranges, segment.startRowId, segment.endRowId, segment.rowCount);
             }
             if (ranges.size() > MAXIMUM_PREDICATE_RANGES) {
                 return null;
@@ -260,7 +318,7 @@ public final class DuckDBSpatialIndex {
         }
 
         if (snapshot.lastIndexedRowId < Long.MAX_VALUE) {
-            addRange(ranges, snapshot.lastIndexedRowId + 1L, Long.MAX_VALUE);
+            addRange(ranges, snapshot.lastIndexedRowId + 1L, Long.MAX_VALUE, 0L);
         }
         return ranges.isEmpty() || ranges.size() > MAXIMUM_PREDICATE_RANGES ? null : ranges;
     }
@@ -439,15 +497,16 @@ public final class DuckDBSpatialIndex {
         }
     }
 
-    private static void addRange(List<RowRange> ranges, long start, long end) {
+    private static void addRange(List<RowRange> ranges, long start, long end, long rows) {
         if (!ranges.isEmpty()) {
             RowRange previous = ranges.get(ranges.size() - 1);
             if (previous.end == Long.MAX_VALUE || start <= previous.end + 1L) {
                 previous.end = Math.max(previous.end, end);
+                previous.rows += rows;
                 return;
             }
         }
-        ranges.add(new RowRange(start, end));
+        ranges.add(new RowRange(start, end, rows));
     }
 
     private static String databaseKey(Connection connection, String prefix) throws SQLException {
@@ -830,10 +889,13 @@ public final class DuckDBSpatialIndex {
 
         private final long start;
         private long end;
+        // rows the range holds (an indexed segment's row count; a gap's rowid span), the open tail not counted
+        private long rows;
 
-        private RowRange(long start, long end) {
+        private RowRange(long start, long end, long rows) {
             this.start = start;
             this.end = end;
+            this.rows = rows;
         }
     }
 
