@@ -238,10 +238,10 @@ public class StandardLookupThread implements Runnable {
                         entityContext = EntityLookupContext.legacy(loadedEntities.getInside(), loadedEntities.getLoadedCandidates());
                     }
 
-                    // a DuckDB lookup the spatial index can't keep small would read whole tables, which on a large
-                    // database fills DuckDB's memory at once: refused instead (rollbacks don't come through here)
+                    // a DuckDB lookup the spatial index can't keep small would read the whole block table, which on a
+                    // large database fills DuckDB's memory at once: refused instead (rollbacks don't come through here)
                     if (ConfigHandler.databaseType.isDuckDB() && radius != null && finalLocation != null && finalLocation.getWorld() != null
-                            && !DuckDBLookupQuery.lookupWithinBudget(connection, WorldUtils.getWorldId(finalLocation.getWorld().getName()), radius, timeStart)) {
+                            && !DuckDBLookupQuery.lookupWithinBudget(connection, "block", WorldUtils.getWorldId(finalLocation.getWorld().getName()), radius, timeStart, timeEnd)) {
                         Chat.sendMessage(player, DuckDBLookupQuery.refuseLookup(player));
                         statement.close();
                         return;

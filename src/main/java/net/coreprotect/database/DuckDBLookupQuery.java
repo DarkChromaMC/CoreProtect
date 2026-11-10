@@ -32,41 +32,45 @@ public final class DuckDBLookupQuery {
 
     public static final String LOOKUP_TOO_BROAD = Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- This lookup covers too much logged history to run safely. Use a smaller radius or a shorter time.";
 
-    /** The tables a location lookup reads (the spatially indexed ones). */
-    private static final String[] LOCATION_TABLES = { "block", "container", "item", "sign", "chat", "command", "session" };
-
     /**
-     * True when a DuckDB lookup in this box would read at most {@link #LOOKUP_MAXIMUM_ROWS} rows in each table: the rows
-     * the spatial index can't rule out (the whole table when it can't narrow) that are newer than timeStart (0 = all
-     * time). The count stops at the limit, and DuckDB skips row groups outside the time window, so it stays cheap.
+     * True when a DuckDB lookup of this table in this box would read at most {@link #LOOKUP_MAXIMUM_ROWS} rows: the rows
+     * the spatial index can't rule out (the whole table when it can't narrow) inside the lookup's time window (0 = open).
+     * The count stops at the limit, and DuckDB skips row groups outside the time window, so it stays cheap.
      */
-    public static boolean lookupWithinBudget(Connection connection, int worldId, int minimumX, int maximumX, int minimumZ, int maximumZ, long timeStart) {
-        return lookupWithinBudget(connection, worldId, minimumX, maximumX, minimumZ, maximumZ, timeStart, LOOKUP_MAXIMUM_ROWS);
+    public static boolean lookupWithinBudget(Connection connection, String table, int worldId, int minimumX, int maximumX, int minimumZ, int maximumZ, long timeStart, long timeEnd) {
+        return lookupWithinBudget(connection, table, worldId, minimumX, maximumX, minimumZ, maximumZ, timeStart, timeEnd, LOOKUP_MAXIMUM_ROWS);
     }
 
-    static boolean lookupWithinBudget(Connection connection, int worldId, int minimumX, int maximumX, int minimumZ, int maximumZ, long timeStart, long maximumRows) {
+    static boolean lookupWithinBudget(Connection connection, String table, int worldId, int minimumX, int maximumX, int minimumZ, int maximumZ, long timeStart, long timeEnd, long maximumRows) {
         if (!ConfigHandler.databaseType.isDuckDB()) {
             return true;
         }
-        for (String table : LOCATION_TABLES) {
-            String source = DuckDBSpatialIndex.tableExpression(connection, ConfigHandler.prefix, table, worldId, minimumX, maximumX, minimumZ, maximumZ, null, null, "budget_rows");
-            String sql = "SELECT COUNT(*) FROM (SELECT 1 FROM " + source + (timeStart > 0 ? " WHERE time >= " + timeStart : "") + " LIMIT " + (maximumRows + 1L) + ")";
-            try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
-                if (resultSet.next() && resultSet.getLong(1) > maximumRows) {
-                    return false;
-                }
-            }
-            catch (SQLException exception) {
-                // a failed check doesn't block staff: the lookup runs as it always did
-                ErrorReporter.report(exception);
-            }
+        String source = DuckDBSpatialIndex.tableExpression(connection, ConfigHandler.prefix, table, worldId, minimumX, maximumX, minimumZ, maximumZ, null, null, "budget_rows");
+        StringBuilder window = new StringBuilder();
+        if (timeStart > 0) {
+            window.append(" WHERE time >= ").append(timeStart);
         }
-        return true;
+        if (timeEnd > 0) {
+            window.append(window.length() == 0 ? " WHERE" : " AND").append(" time <= ").append(timeEnd);
+        }
+        String sql = "SELECT COUNT(*) FROM (SELECT 1 FROM " + source + window + " LIMIT " + (maximumRows + 1L) + ")";
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery(sql)) {
+            return !resultSet.next() || resultSet.getLong(1) <= maximumRows;
+        }
+        catch (SQLException exception) {
+            // a failed check doesn't block staff: the lookup runs as it always did
+            ErrorReporter.report(exception);
+            return true;
+        }
     }
 
     /** {@link #lookupWithinBudget} for a /co lookup radius ({r, minX, maxX, minY, maxY, minZ, maxZ, ...}). */
-    public static boolean lookupWithinBudget(Connection connection, int worldId, Integer[] radius, long timeStart) {
-        return radius == null || radius.length < 7 || lookupWithinBudget(connection, worldId, radius[1], radius[2], radius[5], radius[6], timeStart);
+    public static boolean lookupWithinBudget(Connection connection, String table, int worldId, Integer[] radius, long timeStart, long timeEnd) {
+        return lookupWithinBudget(connection, table, worldId, radius, timeStart, timeEnd, LOOKUP_MAXIMUM_ROWS);
+    }
+
+    static boolean lookupWithinBudget(Connection connection, String table, int worldId, Integer[] radius, long timeStart, long timeEnd, long maximumRows) {
+        return radius == null || radius.length < 7 || lookupWithinBudget(connection, table, worldId, radius[1], radius[2], radius[5], radius[6], timeStart, timeEnd, maximumRows);
     }
 
     /** The lookup refusal; like {@link #refuseInspect} it forgets the sender's previous lookup. */

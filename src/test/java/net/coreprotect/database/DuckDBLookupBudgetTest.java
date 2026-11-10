@@ -65,31 +65,46 @@ class DuckDBLookupBudgetTest {
 
     @Test
     void lookupTheIndexNarrowsRuns() {
-        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, 1, 995, 1005, 995, 1005, 0L, SEGMENT + 10));
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 995, 1005, 995, 1005, 0L, 0L, SEGMENT + 10));
     }
 
     @Test
     void lookupThatReadsTheWholeBigTableIsRefused() {
         // the busy block is in every segment: the index can't narrow it, so all 3 segments would be read
-        assertFalse(DuckDBLookupQuery.lookupWithinBudget(connection, 1, 0, 16, 0, 16, 0L, 2 * SEGMENT));
+        assertFalse(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 0, 16, 0, 16, 0L, 0L, 2 * SEGMENT));
     }
 
     @Test
     void aShortTimeWindowAtABusySpotStillRuns() {
         // only the newest half segment is inside the window, and DuckDB skips the older row groups
-        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, 1, 0, 16, 0, 16, NOW - SEGMENT / 2, 2 * SEGMENT));
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 0, 16, 0, 16, NOW - SEGMENT / 2, 0L, 2 * SEGMENT));
+    }
+
+    @Test
+    void anOldTimeWindowEndStillCounts() {
+        // only rows older than the window's end are read: the first half segment fits, the whole table doesn't
+        long start = NOW - 3 * SEGMENT;
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 0, 16, 0, 16, start, start + SEGMENT / 2, 2 * SEGMENT));
+        assertFalse(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 0, 16, 0, 16, start, NOW, 2 * SEGMENT));
     }
 
     @Test
     void radiusArrayIsReadAsMinMaxXAndZ() {
-        Integer[] radius = { 5, 0, 16, 60, 70, 0, 16 };
-        assertFalse(DuckDBLookupQuery.lookupWithinBudget(connection, 1, radius, 0L) && 3 * SEGMENT > DuckDBLookupQuery.LOOKUP_MAXIMUM_ROWS);
-        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, 1, (Integer[]) null, 0L));
+        // {r, minX, maxX, minY, maxY, minZ, maxZ}: the busy spot is refused, the quiet one runs, so x and z come from 1,2,5,6
+        assertFalse(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, new Integer[] { 5, 0, 16, 60, 70, 0, 16 }, 0L, 0L, 2 * SEGMENT));
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, new Integer[] { 5, 995, 1005, 0, 0, 995, 1005 }, 0L, 0L, SEGMENT + 10));
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, (Integer[]) null, 0L, 0L, 1));
+    }
+
+    @Test
+    void onlyTheReadTableIsCounted() {
+        // the busy block table doesn't refuse a lookup of the empty chat table
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "chat", 1, 0, 16, 0, 16, 0L, 0L, 2 * SEGMENT));
     }
 
     @Test
     void otherDatabasesAreNotChecked() {
         ConfigHandler.databaseType = DatabaseType.SQLITE;
-        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, 1, 0, 16, 0, 16, 0L, 1));
+        assertTrue(DuckDBLookupQuery.lookupWithinBudget(connection, "block", 1, 0, 16, 0, 16, 0L, 0L, 1));
     }
 }

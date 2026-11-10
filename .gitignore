@@ -231,3 +231,6 @@ publish/
 
 # Server side files
 server/*
+
+# test databases
+plugins/CoreProtect/database.duckdb*

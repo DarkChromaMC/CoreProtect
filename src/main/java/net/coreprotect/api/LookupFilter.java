@@ -292,7 +292,7 @@ final class LookupFilter {
         int minimumZ = radius > 0 ? MessageAPI.clampToInt((long) z - radius) : z;
         int maximumZ = radius > 0 ? MessageAPI.clampToInt((long) z + radius) : z;
         int worldId = WorldUtils.getWorldId(location.getWorld().getName());
-        if (!DuckDBLookupQuery.lookupWithinBudget(connection, worldId, minimumX, maximumX, minimumZ, maximumZ, checkTime)) {
+        if (!DuckDBLookupQuery.lookupWithinBudget(connection, table, worldId, minimumX, maximumX, minimumZ, maximumZ, checkTime, 0L)) {
             throw new LookupTooBroadException();
         }
         return DuckDBLookupQuery.spatialTable(connection, table, worldId, minimumX, maximumX, minimumZ, maximumZ, alias);
