@@ -46,12 +46,11 @@ public final class DuckDBSpatialIndex {
     // Counts the changes that make a loaded index wrong (reset, rebuild, a write this class didn't publish). A consumer
     // batch publishing new segments is not one: those are appended to the loaded index.
     private static long cacheEpoch;
-    // set while a lookup is loading the index: the segments consumer batches publish meanwhile
-    private static String loadingKey;
-    private static List<PendingSegment> publishedWhileLoading;
+    // set while a lookup is loading the index: collects the segments committed meanwhile
+    private static LoadInProgress loading;
     // how many times the index was read from the database, and a hook run after each read (tests)
     static long cacheLoads;
-    static Runnable afterCacheLoad;
+    static volatile Runnable afterCacheLoad;
 
     private DuckDBSpatialIndex() {
         throw new IllegalStateException("Database class");
@@ -88,14 +87,16 @@ public final class DuckDBSpatialIndex {
                     observedGeneration = runtimeGeneration;
                 }
 
-                WriterState loaded = loadWriterState(connection, prefix);
+                List<PendingSegment> written = new ArrayList<>();
+                WriterState loaded = loadWriterState(connection, prefix, written);
                 synchronized (STATE_LOCK) {
+                    // segments the catch-up scan committed belong in the loaded index whether or not its state is kept
+                    addCommittedSegments(key, written);
                     if (observedGeneration != runtimeGeneration) {
                         continue;
                     }
                     runtimeState = loaded;
                     runtimeKey = key;
-                    dropIndexCache();
                     runtimeGeneration++;
                     return new Transaction(key, prefix, runtimeGeneration, runtimeState.copy());
                 }
@@ -360,7 +361,29 @@ public final class DuckDBSpatialIndex {
         cacheEpoch++;
     }
 
-    private static WriterState loadWriterState(Connection connection, String prefix) throws SQLException {
+    /**
+     * Segments committed to the index table join the loaded index (and a load in progress, which may have read the table
+     * before the commit). A loaded index they don't fit is dropped. Call with STATE_LOCK held.
+     */
+    private static void addCommittedSegments(String key, List<PendingSegment> written) {
+        if (written.isEmpty()) {
+            return;
+        }
+        if (loading != null && key.equals(loading.key)) {
+            loading.committed.addAll(written);
+        }
+        if (indexCache != null && key.equals(indexCache.key)) {
+            Map<Source, IndexSnapshot> appended = appendSegments(indexCache.snapshots, written);
+            if (appended == null) {
+                dropIndexCache();
+            }
+            else {
+                indexCache = new IndexCache(key, appended);
+            }
+        }
+    }
+
+    private static WriterState loadWriterState(Connection connection, String prefix, List<PendingSegment> written) throws SQLException {
         WriterState state = new WriterState();
         DuckDBConnection duckDBConnection = connection.unwrap(DuckDBConnection.class);
         try (Connection scanConnection = duckDBConnection.duplicate(); Connection metadataConnection = duckDBConnection.duplicate()) {
@@ -373,7 +396,7 @@ public final class DuckDBSpatialIndex {
                 long indexedThrough = indexedThrough(scanConnection, prefix, source);
                 long highWater = sourceHighWater(scanConnection, prefix, source);
                 if (highWater > indexedThrough) {
-                    scanSource(scanConnection, metadataConnection, prefix, source, indexedThrough, highWater, state);
+                    scanSource(scanConnection, metadataConnection, prefix, source, indexedThrough, highWater, state, written);
                 }
             }
         }
@@ -395,7 +418,7 @@ public final class DuckDBSpatialIndex {
     }
 
     private static void scanSource(Connection connection, Connection metadataConnection, String prefix, Source source,
-            long indexedThrough, long highWater, WriterState state) throws SQLException {
+            long indexedThrough, long highWater, WriterState state, List<PendingSegment> written) throws SQLException {
         String sql = "SELECT rowid,wid,x,z" + (source.entityRows ? ",entity_spawn_rowid" : "") + " FROM " + prefix + source.table
                 + " WHERE rowid>? AND rowid<=? ORDER BY rowid";
         String nextSql = "SELECT min(rowid) FROM " + prefix + source.table + " WHERE rowid>? AND rowid<=?";
@@ -420,7 +443,7 @@ public final class DuckDBSpatialIndex {
                         Integer entitySpawnRowId = source.entityRows ? resultSet.getInt("entity_spawn_rowid") : null;
                         accumulator.add(rowId, resultSet.getInt("wid"), resultSet.getInt("x"), resultSet.getInt("z"), entitySpawnRowId);
                         if (accumulator.completed.size() != completedCount && state.completedCount() >= INDEX_CHECKPOINT_SEGMENTS) {
-                            writeCompleted(metadataConnection, prefix, state);
+                            writeCompleted(metadataConnection, prefix, state, written);
                         }
                     }
                 }
@@ -445,13 +468,15 @@ public final class DuckDBSpatialIndex {
             throw new SQLException("DuckDB spatial index scan ended before its high water mark for " + source.table);
         }
         accumulator.finish();
-        writeCompleted(metadataConnection, prefix, state);
+        writeCompleted(metadataConnection, prefix, state, written);
     }
 
-    private static void writeCompleted(Connection connection, String prefix, WriterState state) throws SQLException {
+    private static void writeCompleted(Connection connection, String prefix, WriterState state, List<PendingSegment> written) throws SQLException {
         try {
-            if (state.writeCompleted(connection, prefix)) {
+            List<PendingSegment> batch = new ArrayList<>();
+            if (state.writeCompleted(connection, prefix, batch)) {
                 connection.commit();
+                written.addAll(batch);
             }
         }
         catch (SQLException | RuntimeException | Error exception) {
@@ -482,8 +507,7 @@ public final class DuckDBSpatialIndex {
                         return indexCache.snapshots;
                     }
                     observedEpoch = cacheEpoch;
-                    loadingKey = key;
-                    publishedWhileLoading = new ArrayList<>();
+                    loading = new LoadInProgress(key);
                 }
 
                 Map<Source, IndexSnapshot> loaded;
@@ -496,23 +520,21 @@ public final class DuckDBSpatialIndex {
                 }
                 catch (SQLException | RuntimeException | Error exception) {
                     synchronized (STATE_LOCK) {
-                        loadingKey = null;
-                        publishedWhileLoading = null;
+                        loading = null;
                     }
                     throw exception;
                 }
 
                 synchronized (STATE_LOCK) {
-                    List<PendingSegment> published = publishedWhileLoading;
-                    loadingKey = null;
-                    publishedWhileLoading = null;
+                    List<PendingSegment> committed = loading.committed;
+                    loading = null;
                     if (observedEpoch != cacheEpoch) {
                         // the index was reset or rebuilt meanwhile: what was read may be wrong
                         continue;
                     }
                     // a batch that committed during the read isn't in it; its segments are added here, so a busy
                     // consumer never makes a lookup read the index twice
-                    Map<Source, IndexSnapshot> current = appendSegments(loaded, published);
+                    Map<Source, IndexSnapshot> current = appendSegments(loaded, committed);
                     if (current == null) {
                         return loaded;
                     }
@@ -539,6 +561,8 @@ public final class DuckDBSpatialIndex {
             segments.put(source, new ArrayList<>());
         }
         String sql = "SELECT table_id,start_rowid,end_rowid,row_count,chunks,entities FROM " + prefix + "duckdb_spatial_index";
+        // Its own connection: it sees everything committed (a lookup's connection may be reading an older snapshot, and
+        // what is loaded here is kept), and streaming can be switched on without changing the caller's connection.
         try (Connection loadConnection = connection.unwrap(DuckDBConnection.class).duplicate(); Statement statement = loadConnection.createStatement()) {
             statement.execute("SET jdbc_stream_results=true");
             try (ResultSet resultSet = statement.executeQuery(sql)) {
@@ -692,31 +716,20 @@ public final class DuckDBSpatialIndex {
 
         void publish() {
             synchronized (STATE_LOCK) {
+                // The loaded index gains the segments this batch committed instead of being dropped. Dropping it made
+                // the next lookup read the whole index again, every time any table completed a segment. A batch that
+                // wrote none (also one that was rolled back) leaves the index table, and so the loaded index, as it was.
+                if (flushed && metadataChanged) {
+                    addCommittedSegments(key, written);
+                }
                 if (!flushed || !key.equals(runtimeKey) || generation != runtimeGeneration) {
                     runtimeKey = null;
                     runtimeState = null;
-                    dropIndexCache();
                     runtimeGeneration++;
                     return;
                 }
                 runtimeState = state;
                 runtimeGeneration++;
-                if (metadataChanged) {
-                    // The loaded index gains the new segments instead of being dropped. Dropping it made the next
-                    // lookup read the whole index again, every time any table completed a segment.
-                    if (key.equals(loadingKey)) {
-                        publishedWhileLoading.addAll(written);
-                    }
-                    if (indexCache != null && key.equals(indexCache.key)) {
-                        Map<Source, IndexSnapshot> appended = appendSegments(indexCache.snapshots, written);
-                        if (appended == null) {
-                            dropIndexCache();
-                        }
-                        else {
-                            indexCache = new IndexCache(key, appended);
-                        }
-                    }
-                }
             }
         }
     }
@@ -769,11 +782,8 @@ public final class DuckDBSpatialIndex {
                 runtimeKey = null;
                 runtimeState = null;
             }
-            if (indexCache != null && key.equals(indexCache.key)) {
-                indexCache = null;
-            }
-            // counted even with nothing loaded: a load in progress must not keep what it read
-            cacheEpoch++;
+            // also with nothing loaded: a load in progress must not keep what it read
+            dropIndexCache();
             runtimeGeneration++;
         }
     }
@@ -1005,6 +1015,16 @@ public final class DuckDBSpatialIndex {
             this.x = x;
             this.z = z;
             this.entitySpawnRowId = entitySpawnRowId;
+        }
+    }
+
+    private static final class LoadInProgress {
+
+        private final String key;
+        private final List<PendingSegment> committed = new ArrayList<>();
+
+        private LoadInProgress(String key) {
+            this.key = key;
         }
     }
 

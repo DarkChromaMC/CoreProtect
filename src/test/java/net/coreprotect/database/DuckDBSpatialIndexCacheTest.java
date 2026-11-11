@@ -59,8 +59,6 @@ class DuckDBSpatialIndexCacheTest {
             }
         }
         builder.writeCompleted(connection);
-        // the consumer's first batch after a start rebuilds its writer state and drops the loaded index once; do that here
-        DuckDBSpatialIndex.begin(connection, "co_");
         DuckDBSpatialIndex.cacheLoads = 0;
     }
 
@@ -153,6 +151,33 @@ class DuckDBSpatialIndexCacheTest {
         transaction.publish();
         assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT) + ";", ranges(8, 8));
         assertEquals("rowid > " + (2 * SEGMENT) + ";", ranges(-9000, -9000));
+        assertEquals(1, DuckDBSpatialIndex.cacheLoads);
+    }
+
+    @Test
+    void aBatchThatWroteNothingKeepsTheLoadedIndex() throws Exception {
+        ranges(8, 8);
+        // rolled back before its flush, as an acknowledged rollback is: the index table is unchanged
+        DuckDBSpatialIndex.begin(connection, "co_").publish();
+        ranges(8, 8);
+        // the writer state is rebuilt by the next batch, which doesn't touch the loaded index either
+        writeSegment(2 * SEGMENT + 1, -9000, -9000);
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT) + ";", ranges(8, 8));
+        assertEquals(1, DuckDBSpatialIndex.cacheLoads);
+    }
+
+    @Test
+    void theFirstBatchAfterAStartAddsItsCatchUpSegmentsToTheLoadedIndex() throws Exception {
+        // a whole segment of rows logged but never indexed (a crash before the batch's index rows were written)
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO co_block SELECT i, i, 1, -9000, 64, -9000 FROM range(" + (2 * SEGMENT + 1) + ", " + (3 * SEGMENT + 1) + ") t(i)");
+        }
+        DuckDBSpatialIndex.reset();
+        DuckDBSpatialIndex.cacheLoads = 0;
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (2 * SEGMENT) + ";", ranges(8, 8));
+
+        DuckDBSpatialIndex.begin(connection, "co_");
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT) + ";", ranges(8, 8));
         assertEquals(1, DuckDBSpatialIndex.cacheLoads);
     }
 
