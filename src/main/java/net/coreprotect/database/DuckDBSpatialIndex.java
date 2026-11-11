@@ -46,6 +46,9 @@ public final class DuckDBSpatialIndex {
     private static long cacheEpoch;
     // set while a lookup is loading the index: collects the segments committed meanwhile
     private static LoadInProgress loading;
+    // how many times the index was read from the database, and a hook run after each read (tests)
+    static long cacheLoads;
+    static volatile Runnable afterCacheLoad;
 
     private DuckDBSpatialIndex() {
         throw new IllegalStateException("Database class");
@@ -455,6 +458,10 @@ public final class DuckDBSpatialIndex {
                 Map<Source, IndexSnapshot> loaded;
                 try {
                     loaded = loadSnapshots(connection, prefix);
+                    Runnable hook = afterCacheLoad;
+                    if (hook != null) {
+                        hook.run();
+                    }
                 }
                 catch (SQLException | RuntimeException | Error exception) {
                     synchronized (STATE_LOCK) {
@@ -532,6 +539,9 @@ public final class DuckDBSpatialIndex {
             for (Segment segment : sorted) {
                 snapshot.lastIndexedRowId = Math.max(snapshot.lastIndexedRowId, segment.endRowId);
             }
+        }
+        synchronized (STATE_LOCK) {
+            cacheLoads++;
         }
         return loaded;
     }
