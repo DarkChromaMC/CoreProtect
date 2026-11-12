@@ -2,12 +2,14 @@ package net.coreprotect.database;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
 
@@ -177,6 +179,23 @@ class DuckDBSpatialIndexCacheTest {
         assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (2 * SEGMENT) + ";", ranges(8, 8));
 
         DuckDBSpatialIndex.begin(connection, "co_");
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT) + ";", ranges(8, 8));
+        assertEquals(1, DuckDBSpatialIndex.cacheLoads);
+    }
+
+    @Test
+    void aCatchUpThatFailsLaterStillAddsWhatItCommitted() throws Exception {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO co_block SELECT i, i, 1, -9000, 64, -9000 FROM range(" + (2 * SEGMENT + 1) + ", " + (3 * SEGMENT + 1) + ") t(i)");
+            // the scan indexes the block table first, then fails on this one
+            statement.execute("DROP TABLE co_session");
+        }
+        DuckDBSpatialIndex.reset();
+        DuckDBSpatialIndex.cacheLoads = 0;
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (2 * SEGMENT) + ";", ranges(8, 8));
+
+        assertThrows(SQLException.class, () -> DuckDBSpatialIndex.begin(connection, "co_"));
+        // the block segment is committed, so a retry won't write it again: the loaded index must already have it
         assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT) + ";", ranges(8, 8));
         assertEquals(1, DuckDBSpatialIndex.cacheLoads);
     }
