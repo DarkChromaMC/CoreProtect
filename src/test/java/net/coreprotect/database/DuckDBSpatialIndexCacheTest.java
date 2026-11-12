@@ -181,6 +181,68 @@ class DuckDBSpatialIndexCacheTest {
         assertEquals(1, DuckDBSpatialIndex.cacheLoads);
     }
 
+    /** 300 short segments after the two full ones, six rows each in its own chunk, with four unused row IDs after each. */
+    private void addShortSegmentsWithGaps() throws Exception {
+        DuckDBSpatialIndex.Builder builder = DuckDBSpatialIndex.builder("co_");
+        try (Statement statement = connection.createStatement()) {
+            for (int segment = 0; segment < 300; segment++) {
+                long first = 2 * SEGMENT + 1 + segment * 10L;
+                int position = -20_000 - segment * 16;
+                statement.execute("INSERT INTO co_block SELECT i, i, 1, " + position + ", 64, " + position + " FROM range(" + first + ", " + (first + 6) + ") t(i)");
+                for (long rowId = first; rowId < first + 6; rowId++) {
+                    builder.add("block", rowId, 1, position, position);
+                }
+                builder.finish(connection, "block");
+            }
+        }
+    }
+
+    @Test
+    void emptyGapsBetweenSegmentsAreNotRead() throws Exception {
+        addShortSegmentsWithGaps();
+        long first = 2 * SEGMENT + 1 + 7 * 10L;
+        long last = 2 * SEGMENT + 1 + 299 * 10L + 5;
+        // 300 gaps would be more ranges than a lookup may have; none holds a row, so only the matching segment is read
+        assertEquals("rowid BETWEEN " + first + " AND " + (first + 5) + ";rowid > " + last + ";", ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
+    }
+
+    @Test
+    void aGapThatHoldsARowIsStillRead() throws Exception {
+        addShortSegmentsWithGaps();
+        long stray = 2 * SEGMENT + 1 + 40 * 10L + 8;
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO co_block VALUES (" + stray + ", 1, 1, 77777, 64, 77777)");
+        }
+        DuckDBSpatialIndex.reset();
+        long first = 2 * SEGMENT + 1 + 7 * 10L;
+        long last = 2 * SEGMENT + 1 + 299 * 10L + 5;
+        assertEquals("rowid BETWEEN " + first + " AND " + (first + 5) + ";rowid BETWEEN " + (stray - 2) + " AND " + (stray + 1) + ";rowid > " + last + ";",
+                ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
+    }
+
+    @Test
+    void aRolledBackBatchDoesNotCloseAShortSegment() throws Exception {
+        // a committed batch that leaves a part-filled segment in the writer's memory
+        DuckDBSpatialIndex.Transaction transaction = DuckDBSpatialIndex.begin(connection, "co_");
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO co_block SELECT i, i, 1, 50, 64, 50 FROM range(" + (2 * SEGMENT + 1) + ", " + (2 * SEGMENT + 11) + ") t(i)");
+        }
+        for (long rowId = 2 * SEGMENT + 1; rowId <= 2 * SEGMENT + 10; rowId++) {
+            transaction.addBlock(rowId, 1, 50, 50);
+        }
+        transaction.flush(connection);
+        transaction.publish();
+
+        // a batch rolled back before its flush, then the next batch starting
+        DuckDBSpatialIndex.begin(connection, "co_").publish();
+        DuckDBSpatialIndex.begin(connection, "co_");
+
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery("SELECT COUNT(*) FROM co_duckdb_spatial_index WHERE table_id = 0")) {
+            assertTrue(resultSet.next());
+            assertEquals(2, resultSet.getLong(1));
+        }
+    }
+
     @Test
     void aResetDuringTheReadMakesTheLookupReadAgain() {
         boolean[] ran = { false };
