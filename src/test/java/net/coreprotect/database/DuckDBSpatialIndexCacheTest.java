@@ -270,6 +270,46 @@ class DuckDBSpatialIndexCacheTest {
         assertEquals("rowid BETWEEN " + first + " AND " + (first + 5) + ";rowid > " + last + ";", ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
     }
 
+    private long storedEmptyThrough() throws Exception {
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery("SELECT empty_through FROM co_duckdb_spatial_gaps WHERE table_id = 0")) {
+            return resultSet.next() ? resultSet.getLong(1) : -1L;
+        }
+    }
+
+    @Test
+    void gapsFoundEmptyStayKnownAfterRowsAreDeleted() throws Exception {
+        addShortSegmentsWithGaps();
+        long first = 2 * SEGMENT + 1 + 7 * 10L;
+        long last = 2 * SEGMENT + 1 + 299 * 10L + 5;
+        String expected = "rowid BETWEEN " + first + " AND " + (first + 5) + ";rowid > " + last + ";";
+        assertEquals(expected, ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
+        assertEquals(last, storedEmptyThrough());
+
+        // a purge after that: the row counts no longer match, but nothing has to be checked again
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("DELETE FROM co_block WHERE rowid BETWEEN 100 AND 199");
+            statement.execute("ALTER TABLE co_block RENAME TO co_block_moved");
+            statement.execute("CREATE VIEW co_block AS SELECT * FROM co_block_moved WHERE error('the block table was read to check gaps') IS NULL");
+        }
+        DuckDBSpatialIndex.reset();
+        assertEquals(expected, ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
+    }
+
+    @Test
+    void anAbandonedBatchMakesTheNextOneIndexItsRows() throws Exception {
+        // a batch whose rows were committed but whose outcome the consumer couldn't confirm
+        DuckDBSpatialIndex.Transaction lost = DuckDBSpatialIndex.begin(connection, "co_");
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("INSERT INTO co_block SELECT i, i, 1, -9000, 64, -9000 FROM range(" + (2 * SEGMENT + 1) + ", " + (2 * SEGMENT + 11) + ") t(i)");
+        }
+        lost.abandon();
+
+        // the next batch fills a segment elsewhere; the lost rows must still be found at their position
+        writeSegment(2 * SEGMENT + 11, 30_000, 30_000);
+        String found = ranges(-9000, -9000);
+        assertTrue(found.contains("rowid BETWEEN " + (2 * SEGMENT + 1) + " AND " + (2 * SEGMENT + 10) + ";"), found);
+    }
+
     @Test
     void aResetDuringTheReadMakesTheLookupReadAgain() {
         boolean[] ran = { false };

@@ -35,8 +35,8 @@ public final class DuckDBSpatialIndex {
     private static final long MAXIMUM_FILTER_PROBES = 2_000_000L;
     private static final int INDEX_CHECKPOINT_SEGMENTS = 64;
     private static final int BOOTSTRAP_PAGE_ROWS = 10_000;
-    // gaps checked one by one when the row counts can't show that all of them are empty
-    private static final int MAXIMUM_GAP_PROBES = 4_096;
+    // longest one index read spends checking gaps one by one; what is left is checked by a later read
+    private static final long MAXIMUM_GAP_CHECK_NANOS = 3_000_000_000L;
     private static final String DEFAULT_ALIAS = "duckdb_spatial_rows";
     private static final Object STATE_LOCK = new Object();
     private static final ReentrantLock INITIALIZATION_LOCK = new ReentrantLock();
@@ -69,6 +69,11 @@ public final class DuckDBSpatialIndex {
                 + "chunks BLOB NOT NULL,"
                 + "entities BLOB,"
                 + "PRIMARY KEY(table_id,start_rowid))");
+        // Per table, the row ID up to which every gap between segments is known to hold no rows. Row IDs only grow, so
+        // a gap found empty stays empty and isn't checked again, also after rows were deleted.
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "duckdb_spatial_gaps ("
+                + "table_id TINYINT PRIMARY KEY,"
+                + "empty_through BIGINT NOT NULL)");
         reset();
     }
 
@@ -315,7 +320,7 @@ public final class DuckDBSpatialIndex {
         for (Segment segment : snapshot.segments) {
             // Row IDs between two segments belong to no segment. Most are IDs a rolled back batch used up, with no
             // rows; a gap is read only while it isn't known to be empty.
-            if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L && !snapshot.emptyGapsBefore.contains(segment.startRowId)) {
+            if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L && !snapshot.gapIsEmpty(segment)) {
                 addRange(ranges, previousEnd + 1L, segment.startRowId - 1L, segment.startRowId - 1L - previousEnd);
             }
             previousEnd = Math.max(previousEnd, segment.endRowId);
@@ -606,19 +611,26 @@ public final class DuckDBSpatialIndex {
             }
             // Gaps older builds left in the index. A failed check leaves them to be read as before; it also ends the
             // transaction, so the remaining tables aren't checked.
+            Map<Source, Long> checked = new EnumMap<>(Source.class);
             try {
+                long deadline = System.nanoTime() + MAXIMUM_GAP_CHECK_NANOS;
                 for (Source source : Source.values()) {
-                    findEmptyGaps(loadConnection, prefix, source, loaded.get(source));
+                    Long emptyThrough = findEmptyGaps(loadConnection, prefix, source, loaded.get(source), deadline);
+                    if (emptyThrough != null) {
+                        checked.put(source, emptyThrough);
+                    }
                 }
             }
-            catch (SQLException exception) {
+            catch (SQLException | RuntimeException exception) {
                 ErrorReporter.report(exception);
             }
             try {
                 loadConnection.rollback();
+                loadConnection.setAutoCommit(true);
+                storeEmptyGaps(loadConnection, prefix, checked);
             }
-            catch (SQLException exception) {
-                // the index was read; the connection is closed next
+            catch (SQLException | RuntimeException exception) {
+                // the index was read; what was checked is checked again by the next read
             }
         }
         synchronized (STATE_LOCK) {
@@ -628,58 +640,98 @@ public final class DuckDBSpatialIndex {
     }
 
     /**
-     * Records which gaps between this table's segments hold no rows, so lookups don't have to read them. A server whose
-     * batches are often rolled back gets thousands of such gaps (each rollback uses up row IDs), and a lookup that has to
-     * read more than MAXIMUM_PREDICATE_RANGES ranges isn't narrowed at all.
+     * Finds the gaps between this table's segments that hold no rows, so lookups don't have to read them. A server whose
+     * batches were often rolled back has thousands of them (each rollback used up row IDs and closed a short segment),
+     * and a lookup with more than MAXIMUM_PREDICATE_RANGES ranges isn't narrowed at all. Returns the row ID up to which
+     * every gap is now known to be empty when that is further than what is stored, else null.
      */
-    private static void findEmptyGaps(Connection connection, String prefix, Source source, IndexSnapshot snapshot) throws SQLException {
+    private static Long findEmptyGaps(Connection connection, String prefix, Source source, IndexSnapshot snapshot, long deadline) throws SQLException {
         if (!snapshot.usable) {
-            return;
+            return null;
         }
-        // {first row ID of the gap, last row ID of the gap, start of the segment after it}
+        long stored = 0L;
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery("SELECT empty_through FROM " + prefix + "duckdb_spatial_gaps WHERE table_id=" + source.id)) {
+            if (resultSet.next()) {
+                stored = resultSet.getLong(1);
+            }
+        }
+        snapshot.gapsEmptyThrough = stored;
+
+        // the gaps not known to be empty yet: {first row ID, last row ID, start of the segment after it}
         List<long[]> gaps = new ArrayList<>();
         long previousEnd = 0L;
         long indexedRows = 0L;
         for (Segment segment : snapshot.segments) {
-            if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L) {
+            if (previousEnd < Long.MAX_VALUE && segment.startRowId > previousEnd + 1L && segment.startRowId - 1L > stored) {
                 gaps.add(new long[] { previousEnd + 1L, segment.startRowId - 1L, segment.startRowId });
             }
             previousEnd = Math.max(previousEnd, segment.endRowId);
             indexedRows += segment.rowCount;
         }
         if (gaps.isEmpty()) {
-            return;
+            return null;
         }
 
         String tableName = prefix + source.table;
         // Every segment holds exactly the rows it counted unless rows were deleted since. If the table still has as many
         // rows as the segments counted, none is in a gap (short of as many rows deleted from segments as were written
         // around the index, which the index doesn't allow for anywhere else either).
-        Set<Long> empty = new HashSet<>();
-        boolean allEmpty;
         try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery("SELECT COUNT(*) FROM " + tableName + " WHERE rowid <= " + snapshot.lastIndexedRowId)) {
-            allEmpty = resultSet.next() && resultSet.getLong(1) == indexedRows;
-        }
-        if (allEmpty) {
-            for (long[] gap : gaps) {
-                empty.add(gap[2]);
+            if (resultSet.next() && resultSet.getLong(1) == indexedRows) {
+                snapshot.gapsEmptyThrough = snapshot.lastIndexedRowId;
+                return snapshot.lastIndexedRowId;
             }
         }
-        else if (gaps.size() <= MAXIMUM_GAP_PROBES) {
-            try (PreparedStatement statement = connection.prepareStatement("SELECT 1 FROM " + tableName + " WHERE rowid BETWEEN ? AND ? LIMIT 1")) {
-                for (long[] gap : gaps) {
-                    statement.setLong(1, gap[0]);
-                    statement.setLong(2, gap[1]);
-                    try (ResultSet resultSet = statement.executeQuery()) {
-                        if (!resultSet.next()) {
-                            empty.add(gap[2]);
-                        }
-                    }
+
+        // Rows were deleted, or a gap does hold rows: one by one, oldest first. Everything before the first gap that
+        // holds rows (or wasn't reached in time) is remembered for good, the empty ones after it for this read only.
+        Set<Long> emptyGapsBefore = new HashSet<>();
+        boolean unbroken = true;
+        long emptyThrough = stored;
+        try (PreparedStatement statement = connection.prepareStatement("SELECT 1 FROM " + tableName + " WHERE rowid BETWEEN ? AND ? LIMIT 1")) {
+            for (long[] gap : gaps) {
+                if (System.nanoTime() - deadline > 0L) {
+                    unbroken = false;
+                    break;
+                }
+                statement.setLong(1, gap[0]);
+                statement.setLong(2, gap[1]);
+                boolean empty;
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    empty = !resultSet.next();
+                }
+                if (!empty) {
+                    unbroken = false;
+                }
+                else if (unbroken) {
+                    emptyThrough = gap[1];
+                }
+                else {
+                    emptyGapsBefore.add(gap[2]);
                 }
             }
         }
-        // else: rows were deleted and there are too many gaps to check one by one; they are read as before
-        snapshot.emptyGapsBefore = empty;
+        if (unbroken) {
+            emptyThrough = snapshot.lastIndexedRowId;
+        }
+        snapshot.gapsEmptyThrough = emptyThrough;
+        snapshot.emptyGapsBefore = emptyGapsBefore;
+        return emptyThrough > stored ? emptyThrough : null;
+    }
+
+    private static void storeEmptyGaps(Connection connection, String prefix, Map<Source, Long> checked) throws SQLException {
+        if (checked.isEmpty()) {
+            return;
+        }
+        String sql = "INSERT INTO " + prefix + "duckdb_spatial_gaps (table_id,empty_through) VALUES (?,?) "
+                + "ON CONFLICT (table_id) DO UPDATE SET empty_through = GREATEST(empty_through, excluded.empty_through)";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            for (Map.Entry<Source, Long> entry : checked.entrySet()) {
+                statement.setInt(1, entry.getKey().id);
+                statement.setLong(2, entry.getValue());
+                statement.executeUpdate();
+            }
+        }
     }
 
     /**
@@ -712,6 +764,7 @@ public final class DuckDBSpatialIndex {
                 copy.usable = snapshot.usable;
                 // shared, not copied: it isn't changed after the index was read
                 copy.emptyGapsBefore = snapshot.emptyGapsBefore;
+                copy.gapsEmptyThrough = snapshot.gapsEmptyThrough;
                 appended.put(value.source, copy);
                 snapshot = copy;
             }
@@ -797,6 +850,20 @@ public final class DuckDBSpatialIndex {
             flushed = true;
         }
 
+        /**
+         * For a batch whose commit failed or whose outcome isn't known: its rows may be in the tables without having
+         * reached the writer state, so the next batch rebuilds that state from the tables.
+         */
+        void abandon() {
+            synchronized (STATE_LOCK) {
+                if (key.equals(runtimeKey)) {
+                    runtimeKey = null;
+                    runtimeState = null;
+                }
+                runtimeGeneration++;
+            }
+        }
+
         void publish() {
             synchronized (STATE_LOCK) {
                 // The loaded index gains the segments this batch committed instead of being dropped. Dropping it made
@@ -805,21 +872,15 @@ public final class DuckDBSpatialIndex {
                 if (flushed && metadataChanged) {
                     addCommittedSegments(key, written);
                 }
-                boolean current = key.equals(runtimeKey) && generation == runtimeGeneration;
-                if (!flushed) {
-                    // Rolled back before its flush: nothing was committed, so the state the batch started from still
-                    // describes the tables. Rebuilding it closed a short segment every time.
-                    if (!current) {
-                        runtimeKey = null;
-                        runtimeState = null;
-                        runtimeGeneration++;
-                    }
-                    return;
-                }
-                if (!current) {
+                if (!key.equals(runtimeKey) || generation != runtimeGeneration) {
                     runtimeKey = null;
                     runtimeState = null;
                     runtimeGeneration++;
+                    return;
+                }
+                if (!flushed) {
+                    // Rolled back before its flush: nothing was committed, so the state the batch started from still
+                    // describes the tables. Rebuilding it closed a short segment every time.
                     return;
                 }
                 runtimeState = state;
@@ -871,6 +932,10 @@ public final class DuckDBSpatialIndex {
 
     private static void invalidateExternalWrite(Connection connection, String prefix) throws SQLException {
         String key = databaseKey(connection, prefix);
+        // a rebuilt index may describe rewritten tables: its gaps are checked afresh
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("DELETE FROM " + prefix + "duckdb_spatial_gaps");
+        }
         synchronized (STATE_LOCK) {
             if (key.equals(runtimeKey)) {
                 runtimeKey = null;
@@ -1145,6 +1210,13 @@ public final class DuckDBSpatialIndex {
         private final List<Segment> segments = new ArrayList<>();
         // start row IDs of the segments whose gap before them is known to hold no rows
         private Set<Long> emptyGapsBefore = Collections.emptySet();
+        // every gap that ends at or before this row ID is known to hold no rows
+        private long gapsEmptyThrough;
+
+        /** True when the row IDs between this segment and the one before it are known to hold no rows. */
+        private boolean gapIsEmpty(Segment segment) {
+            return segment.startRowId - 1L <= gapsEmptyThrough || emptyGapsBefore.contains(segment.startRowId);
+        }
         private long lastIndexedRowId;
         private boolean usable = true;
     }
