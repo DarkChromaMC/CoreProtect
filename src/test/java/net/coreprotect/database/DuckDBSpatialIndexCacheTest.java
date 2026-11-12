@@ -244,6 +244,33 @@ class DuckDBSpatialIndexCacheTest {
     }
 
     @Test
+    void aSegmentWrittenAfterUnusedRowIdsLeavesNoGap() throws Exception {
+        // 100 row IDs used up by a rolled back batch, then a full segment
+        writeSegment(2 * SEGMENT + 101, -9000, -9000);
+        try (Statement statement = connection.createStatement(); ResultSet resultSet = statement.executeQuery("SELECT start_rowid, end_rowid, row_count FROM co_duckdb_spatial_index WHERE table_id = 0 ORDER BY start_rowid DESC LIMIT 1")) {
+            assertTrue(resultSet.next());
+            assertEquals(2 * SEGMENT + 1, resultSet.getLong(1));
+            assertEquals(3 * SEGMENT + 100, resultSet.getLong(2));
+            assertEquals(SEGMENT, resultSet.getLong(3));
+        }
+        assertEquals("rowid BETWEEN 1 AND " + SEGMENT + ";rowid > " + (3 * SEGMENT + 100) + ";", ranges(8, 8));
+        assertEquals("rowid > " + (2 * SEGMENT) + ";", ranges(-9000, -9000));
+    }
+
+    @Test
+    void deletedRowsMakeTheGapsBeCheckedOneByOne() throws Exception {
+        addShortSegmentsWithGaps();
+        try (Statement statement = connection.createStatement()) {
+            // a purge: the table no longer has as many rows as the segments counted
+            statement.execute("DELETE FROM co_block WHERE rowid BETWEEN 100 AND 199");
+        }
+        DuckDBSpatialIndex.reset();
+        long first = 2 * SEGMENT + 1 + 7 * 10L;
+        long last = 2 * SEGMENT + 1 + 299 * 10L + 5;
+        assertEquals("rowid BETWEEN " + first + " AND " + (first + 5) + ";rowid > " + last + ";", ranges(-20_000 - 7 * 16, -20_000 - 7 * 16));
+    }
+
+    @Test
     void aResetDuringTheReadMakesTheLookupReadAgain() {
         boolean[] ran = { false };
         DuckDBSpatialIndex.afterCacheLoad = () -> {
