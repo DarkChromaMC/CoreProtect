@@ -117,6 +117,16 @@ public class CoreProtectAPI extends Queue {
     }
 
     /**
+     * CatCraft: true when performRollback and performRestore accept the container action (4) and then undo or
+     * redo container item changes (items put into or taken out of chests, furnaces and the like).
+     *
+     * @return true on CatCraft builds with container rollbacks in the API
+     */
+    public boolean supportsContainerRollback() {
+        return true;
+    }
+
+    /**
      * Performs a block lookup at the specified block.
      * 
      * @param block
@@ -1036,7 +1046,11 @@ public class CoreProtectAPI extends Queue {
         boolean explicitActions = actionList != null && !actionList.isEmpty();
         actionList = actionList == null ? new ArrayList<>() : new ArrayList<>(actionList);
         if (explicitActions) {
-            actionList.removeIf(actionListItem -> !isSupportedLegacyAction(actionListItem));
+            // CatCraft: rollbacks and restores (lookup 2) may also ask for container item rows, which the
+            // lookup API never returns. Asked alone, they undo only container changes; see supportsContainerRollback.
+            final int lookupMode = lookup;
+            actionList.removeIf(actionListItem -> !isSupportedLegacyAction(actionListItem)
+                    && !(lookupMode == 2 && actionListItem != null && actionListItem == LookupActions.CONTAINER));
             if (actionList.isEmpty()) {
                 return result;
             }
