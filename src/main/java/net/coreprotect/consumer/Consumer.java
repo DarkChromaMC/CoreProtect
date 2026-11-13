@@ -109,6 +109,13 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
         }
     }
 
+    /** CatCraft: true while a rollback runs or its rolled-back markers are still waiting to be published. */
+    public static boolean rollbackWritesPending() {
+        synchronized (rollbackPurgeGate) {
+            return !ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0;
+        }
+    }
+
     public static int getConsumerSize(int id) {
         if (id == 0 || id == 1) {
             return Consumer.consumer.get(id).size();
