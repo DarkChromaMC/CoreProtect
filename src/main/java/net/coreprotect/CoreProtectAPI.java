@@ -127,6 +127,50 @@ public class CoreProtectAPI extends Queue {
     }
 
     /**
+     * CatCraft: true when performRollback and performRestore accept the item action (11) and then undo or redo a
+     * player's own inventory changes (items picked up, dropped, or moved in and out of containers), like a:inventory.
+     *
+     * @return true on CatCraft builds with inventory rollbacks in the API
+     */
+    public boolean supportsInventoryRollback() {
+        return true;
+    }
+
+    /**
+     * CatCraft: waits until CoreProtect has written everything it queued, including the rolled-back markers of a
+     * rollback or restore that just returned. Rollback markers are written later from the values read during the
+     * rollback, so a second rollback of the same rows started before then can overwrite the first one's markers
+     * (for example a container rollback followed straight away by an inventory rollback). Call this between them.
+     * Must not be called on the server thread.
+     *
+     * @param timeoutMillis how long to wait at most
+     * @return true when the queue was empty, false on timeout or interruption
+     */
+    public boolean awaitPendingWrites(long timeoutMillis) {
+        if (Bukkit.isPrimaryThread()) {
+            throw new IllegalStateException("awaitPendingWrites must not run on the server thread");
+        }
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMillis);
+        int quietChecks = 0;
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                boolean empty = Consumer.getConsumerSize(0) == 0 && Consumer.getConsumerSize(1) == 0 && !Consumer.rollbackWritesPending();
+                quietChecks = empty ? quietChecks + 1 : 0;
+                if (quietChecks >= 3) {
+                    // One more consumer cycle so a batch taken just before the last check is committed too.
+                    Thread.sleep(600);
+                    return Consumer.getConsumerSize(0) == 0 && Consumer.getConsumerSize(1) == 0 && !Consumer.rollbackWritesPending();
+                }
+                Thread.sleep(100);
+            }
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return false;
+    }
+
+    /**
      * Performs a block lookup at the specified block.
      * 
      * @param block
@@ -1046,11 +1090,11 @@ public class CoreProtectAPI extends Queue {
         boolean explicitActions = actionList != null && !actionList.isEmpty();
         actionList = actionList == null ? new ArrayList<>() : new ArrayList<>(actionList);
         if (explicitActions) {
-            // CatCraft: rollbacks and restores (lookup 2) may also ask for container item rows, which the
-            // lookup API never returns. Asked alone, they undo only container changes; see supportsContainerRollback.
+            // CatCraft: rollbacks and restores (lookup 2) may also ask for container item rows (4) or player inventory
+            // rows (11, like a:inventory), which the lookup API never returns. Asked alone, each undoes only those changes.
             final int lookupMode = lookup;
             actionList.removeIf(actionListItem -> !isSupportedLegacyAction(actionListItem)
-                    && !(lookupMode == 2 && actionListItem != null && actionListItem == LookupActions.CONTAINER));
+                    && !(lookupMode == 2 && actionListItem != null && (actionListItem == LookupActions.CONTAINER || actionListItem == LookupActions.ITEM)));
             if (actionList.isEmpty()) {
                 return result;
             }
